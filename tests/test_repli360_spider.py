@@ -1,4 +1,3 @@
-import pytest
 import scrapy
 from Leverage.Leverage.spiders.repli360_spider import Repli360Spider
 

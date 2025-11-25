@@ -3,17 +3,61 @@
 # See documentation in:
 # https://docs.scrapy.org/en/latest/topics/items.html
 
-import scrapy
+from scrapy import Item, Field
 
 
-class ApartmentListingItem(scrapy.Item):
-    building_id = scrapy.Field()
-    unit_number = scrapy.Field()
-    floorplan_name = scrapy.Field()
-    floorplan_id = scrapy.Field()
-    num_bedrooms = scrapy.Field()
-    floor_area = scrapy.Field()
-    rent = scrapy.Field()
-    deposit = scrapy.Field()
-    date_available = scrapy.Field()
-    lease_term = scrapy.Field()
+class PropertyItem(Item):
+    # Metadata
+    scraped_at = Field()
+    template_engine = Field()
+
+    # Identifiers
+    property_name = Field()
+    url = Field()
+
+    # Location
+    address = Field()
+    city = Field()
+    state = Field()
+    postal_code = Field()
+
+
+class UnitItem(Item):
+    # Metadata
+    scraped_at = Field()
+
+    # Price info
+    rent_usd = Field()
+    deposit_usd = Field()
+    admin_fee = Field()
+    application_fee = Field()
+
+    # Availability
+    available_date = Field()
+    is_available = Field()
+    min_lease_term_months = Field()
+
+    # Location
+    building_name = Field()
+    floor_number = Field()
+    top_floor = Field()
+
+    # Floor Plan
+    floorplan_name = Field()
+    floorplan_id = Field()
+    num_bedrooms = Field()
+    num_bathrooms = Field()
+    square_footage = Field()
+
+    # Identifiers
+    unit_number = Field()
+
+
+class PromoItem(Item):
+    # Metadata
+    scraped_at = Field()
+
+    # Data
+    text = Field()
+    ext_floorplan_id = Field()
+    has_available_units = Field()
