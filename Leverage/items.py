@@ -10,6 +10,8 @@ class PropertyItem(Item):
     # Metadata
     scraped_at = Field()
     template_engine = Field()
+    company_name = Field()
+    # company_url = Field()
 
     # Identifiers
     property_name = Field()
@@ -25,6 +27,7 @@ class PropertyItem(Item):
 class UnitItem(Item):
     # Metadata
     scraped_at = Field()
+    property_url = Field()
 
     # Price info
     rent_usd = Field()

@@ -9,13 +9,10 @@ class UDRPropertyIndexer(scrapy.Spider):
     Spider to index UDR properties from the UDR main properties page.
     """
 
-    name: str = "udr_index"
+    name: str = "udr_indexer"
     allowed_domains: list[str] = ["udr.com"]
     start_urls: list[str] = ["https://www.udr.com/search-apartments/"]
-
-    LOCATION_LINK_SELECTOR = (
-        ".location-list__item a.location-list__item-link::attr(href)"
-    )
+    company_name: str = "UDR"
 
     async def start(self):
         for url in self.start_urls:
@@ -27,7 +24,9 @@ class UDRPropertyIndexer(scrapy.Spider):
         Path(filename).write_bytes(response.body)
 
         # Extract property links from the main properties page
-        location_links = response.css(self.LOCATION_LINK_SELECTOR).getall()
+        location_links = response.css(
+            ".location-list__item a.location-list__item-link::attr(href)"
+        ).getall()
         for link in location_links:
             yield scrapy.Request(
                 url=response.urljoin(link),
@@ -36,22 +35,18 @@ class UDRPropertyIndexer(scrapy.Spider):
 
     def parse_location_page(self, response):
         self.logger.info(f"Parsing location page: {response.url}")
-        filename = f"output/{self.name}_location_page.html"
-        Path(filename).write_bytes(response.body)
+        import usaddress
 
         cards = response.css(".community-card")
         for card in cards:
             property_link = card.css("a.community-card__title::attr(href)").get()
             city_state_zip = card.css(".community-card__city-state::text").get()
+            # TODO: consider switch to `usaddress` parsing
             city, state_zip = city_state_zip.split(", ")
             state, zip_code = state_zip.split(" ")
-            print(city, state, zip_code)
-
-            print(
-                card.css(".community-card__title-link::text").get(),
-            )
 
             yield PropertyItem(
+                company_name=self.company_name,
                 property_name=card.css(".community-card__title-link::text").get(),
                 address=card.css(".community-card__number-street::text").get(),
                 city=city,

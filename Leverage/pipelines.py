@@ -73,16 +73,18 @@ class PostgresPipeline:
             match item:
                 case PropertyItem():
                     self.logger.info("Processing PropertyItem...")
-                    property_id = self._upsert_property(item)
-                    self.logger.info(f"Upserted property_id: {property_id}")
+                    company_name = item.get("company_name")
+                    if not company_name:
+                        raise DropItem("PropertyItem missing company_url field.")
+                    company_name = self._get_company_id(company_name)
+                    property_id = self._upsert_property(item, company_name)
 
                 case UnitItem():
                     self.logger.info("Processing UnitItem...")
-                    self.logger.info(spider.start_urls[0])
                     try:
                         url = spider.start_urls[0]
-                        print("Property URL:", url)
-                        # TODO: Pass through Item property_url field from spider to here to avoid issues with multiple start URLs
+                        self.logger.debug(url)
+                        # TODO: Pass Item property_url field from spider to here to avoid issues with multiple start URLs
                     except IndexError:
                         raise DropItem(
                             "No start URL found in spider to determine property."
@@ -107,17 +109,9 @@ class PostgresPipeline:
     def process_unit_item(self, item: UnitItem, property_id: int):
         try:
             self.cur.execute("BEGIN;")
-
-            # UPSERT Floor Plans
             floor_plan_id = self._upsert_floor_plan(item, property_id)
-
-            # UPSERT: Apartment Units
             unit_id = self._upsert_apartment_unit(item, property_id, floor_plan_id)
-
-            # INSERT: Price History
             self._insert_price_history(item, unit_id)
-
-            # Commit the entire transaction only if all steps succeeded
             self.conn.commit()
 
         except Exception as e:
@@ -125,27 +119,50 @@ class PostgresPipeline:
             self.conn.rollback()  # Roll back all changes if any step fails
             raise e
 
-    # The natural key here is the unique URL or the property name itself.
-    def _upsert_property(self, item: PropertyItem) -> int:
+    def _upsert_property(self, item: PropertyItem, company_id: int) -> int:
         # Use a property URL or a combined City/Name as the ON CONFLICT target
+        # TODO! Update primary key to something beyond the URL alone
         sql = """
-            INSERT INTO properties 
-                (property_name, url, template_engine, address, city, state, postal_code)
-            VALUES
-                (%(name)s, %(url)s, %(template)s, %(address)s, %(city)s, %(state)s, %(postal_code)s)
+            INSERT INTO properties (
+                company_id,
+                property_name,
+                url,
+                template_engine,
+                address,
+                city,
+                state,
+                postal_code,
+                updated_source
+            )
+            VALUES (
+                %(company_id)s,
+                %(name)s,
+                %(url)s,
+                %(template)s,
+                %(address)s,
+                %(city)s,
+                %(state)s,
+                %(postal_code)s,
+                'scrape'::update_source_type
+            )
             ON CONFLICT (url) DO UPDATE
             SET
                 property_name = EXCLUDED.property_name,
                 address = EXCLUDED.address,
                 city = EXCLUDED.city,
                 state = EXCLUDED.state,
-                postal_code = EXCLUDED.postal_code
-                --- template_engine = EXCLUDED.template_engine
+                postal_code = EXCLUDED.postal_code,
+                template_engine = EXCLUDED.template_engine,
+                updated_source = 'scrape'::update_source_type
             RETURNING property_id;
         """
+        # NOTE: PostgreSQL increments the counter on GENERATED ALWAYS AS IDENTITY columns on every insert attempt,
+        # even if the insert fails due to a conflict. This is expected behavior.
+
         self.cur.execute(
             sql,
             {
+                "company_id": company_id,
                 "name": item.get("property_name"),
                 "url": item.get("url"),
                 "template": item.get("template_engine"),
@@ -162,26 +179,39 @@ class PostgresPipeline:
                 f"Failed to upsert property with URL={item.get('property_url')}"
             )
 
+        self.logger.info(f"Upserted property_id: {result[0]}")
         return result[0]
 
     def _upsert_floor_plan(self, item: UnitItem, property_id: int) -> int:
         # TODO: Consider if DO UPDATE is needed here to update metadata
         # Check out this: https://stackoverflow.com/questions/34708509/how-to-use-returning-with-on-conflict-in-postgresql
         sql = """
-            WITH upsert AS(
-                INSERT INTO floor_plans (property_id, plan_name, bedrooms, bathrooms, square_footage)
+            WITH upsert AS (
+                INSERT INTO floor_plans (
+                    property_id,
+                    plan_name,
+                    bedrooms,
+                    bathrooms,
+                    square_footage
+                )
                 VALUES (
-                    %(prop_id)s, %(plan_name)s, %(bedrooms)s, %(bathrooms)s, %(square_footage)s
+                    %(prop_id)s,
+                    %(plan_name)s,
+                    %(bedrooms)s,
+                    %(bathrooms)s,
+                    %(square_footage)s
                 )
                 ON CONFLICT (property_id, plan_name) DO NOTHING
                 RETURNING floor_plan_id
             )
             SELECT floor_plan_id FROM upsert
             UNION
-                --- If no rows were inserted, select the existing floor_plan_id
                 SELECT floor_plan_id
                 FROM floor_plans
-                WHERE property_id=%(prop_id)s AND plan_name=%(plan_name)s;
+                WHERE (
+                    property_id = %(prop_id)s
+                    AND plan_name = %(plan_name)s
+                );
         """
         self.cur.execute(
             sql,
@@ -208,19 +238,33 @@ class PostgresPipeline:
     ) -> int:
         sql = """
             WITH upsert AS(
-                INSERT INTO apartment_units (property_id, floor_plan_id, unit_number, floor_number, building_name, is_on_top_floor)
+                INSERT INTO apartment_units (
+                    property_id,
+                    floor_plan_id,
+                    unit_number,
+                    floor_number,
+                    building_name,
+                    is_on_top_floor
+                )
                 VALUES (
-                    %(prop_id)s, %(floor_plan_id)s, %(unit_number)s, %(floor_number)s, %(building_name)s, %(is_on_top_floor)s,
+                    %(prop_id)s,
+                    %(floor_plan_id)s,
+                    %(unit_number)s,
+                    %(floor_number)s,
+                    %(building_name)s,
+                    %(is_on_top_floor)s
                 )
                 ON CONFLICT (property_id, unit_number) DO NOTHING 
                 RETURNING unit_id
             )
             SELECT floor_plan_id FROM upsert
             UNION
-                --- If no rows were inserted, select the existing floor_plan_id
                 SELECT unit_id
                 FROM apartment_units
-                WHERE property_id=%(prop_id)s AND unit_number=%(unit_number)s;
+                WHERE (
+                    property_id = %(prop_id)s 
+                    AND unit_number = %(unit_number)s
+                );
         """
         self.cur.execute(
             sql,
@@ -245,7 +289,14 @@ class PostgresPipeline:
 
     def _insert_price_history(self, item: UnitItem, unit_id: int) -> None:
         sql = """
-            INSERT INTO price_history (scraped_at, unit_id, rent_usd, deposit_usd, min_lease_term_months, available_date)
+            INSERT INTO price_history (
+                scraped_at,
+                unit_id,
+                rent_usd,
+                deposit_usd,
+                min_lease_term_months,
+                available_date
+            )
             VALUES (%s, %s, %s, %s, %s, %s)
         """
         self.cur.execute(
@@ -275,4 +326,17 @@ class PostgresPipeline:
         result = self.cur.fetchone()
         if not result:
             raise ValueError(f"Failed to retrieve property_id for URL={url}")
+        return result[0]
+
+    def _get_company_id(self, company_name: str) -> int:
+        sql = """
+            SELECT company_id FROM management_companies
+            WHERE name = %s;
+        """
+        self.cur.execute(sql, (company_name,))
+        result = self.cur.fetchone()
+        if not result:
+            raise ValueError(
+                f"Failed to retrieve company_id for company_name={company_name}"
+            )
         return result[0]

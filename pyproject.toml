@@ -9,6 +9,7 @@ dependencies = [
     "psycopg2-binary>=2.9.11",
     "scrapy>=2.13.3",
     "scrapy-playwright>=0.0.44",
+    "usaddress>=0.5.16",
 ]
 
 [dependency-groups]
