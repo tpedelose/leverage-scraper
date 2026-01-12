@@ -59,6 +59,8 @@ class UnitItem(Item):
 class PromoItem(Item):
     # Metadata
     scraped_at = Field()
+    ext_promo_id = Field()
+    property_url = Field()
 
     # Data
     text = Field()

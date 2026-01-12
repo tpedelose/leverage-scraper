@@ -109,8 +109,8 @@ class PostgresPipeline:
     def process_unit_item(self, item: UnitItem, property_id: int):
         try:
             self.cur.execute("BEGIN;")
-            floor_plan_id = self._upsert_floor_plan(item, property_id)
-            unit_id = self._upsert_apartment_unit(item, property_id, floor_plan_id)
+            floorplan_id = self._upsert_floorplan(item, property_id)
+            unit_id = self._upsert_apartment_unit(item, property_id, floorplan_id)
             self._insert_price_history(item, unit_id)
             self.conn.commit()
 
@@ -182,12 +182,12 @@ class PostgresPipeline:
         self.logger.info(f"Upserted property_id: {result[0]}")
         return result[0]
 
-    def _upsert_floor_plan(self, item: UnitItem, property_id: int) -> int:
+    def _upsert_floorplan(self, item: UnitItem, property_id: int) -> int:
         # TODO: Consider if DO UPDATE is needed here to update metadata
         # Check out this: https://stackoverflow.com/questions/34708509/how-to-use-returning-with-on-conflict-in-postgresql
         sql = """
             WITH upsert AS (
-                INSERT INTO floor_plans (
+                INSERT INTO floorplans (
                     property_id,
                     plan_name,
                     bedrooms,
@@ -202,12 +202,12 @@ class PostgresPipeline:
                     %(square_footage)s
                 )
                 ON CONFLICT (property_id, plan_name) DO NOTHING
-                RETURNING floor_plan_id
+                RETURNING floorplan_id
             )
-            SELECT floor_plan_id FROM upsert
+            SELECT floorplan_id FROM upsert
             UNION
-                SELECT floor_plan_id
-                FROM floor_plans
+                SELECT floorplan_id
+                FROM floorplans
                 WHERE (
                     property_id = %(prop_id)s
                     AND plan_name = %(plan_name)s
@@ -227,20 +227,20 @@ class PostgresPipeline:
         result = self.cur.fetchone()
         if not result:
             raise ValueError(
-                f"Failed to retrieve floor_plan_id for property_id={property_id} and plan_name={item.get('floorplan_name')}"
+                f"Failed to retrieve floorplan_id for property_id={property_id} and plan_name={item.get('floorplan_name')}"
             )
 
-        self.logger.info(f"Upserted floor_plan_id: {result[0]}")
+        self.logger.info(f"Upserted floorplan_id: {result[0]}")
         return result[0]
 
     def _upsert_apartment_unit(
-        self, item: UnitItem, property_id: int, floor_plan_id: int
+        self, item: UnitItem, property_id: int, floorplan_id: int
     ) -> int:
         sql = """
             WITH upsert AS(
                 INSERT INTO apartment_units (
                     property_id,
-                    floor_plan_id,
+                    floorplan_id,
                     unit_number,
                     floor_number,
                     building_name,
@@ -248,7 +248,7 @@ class PostgresPipeline:
                 )
                 VALUES (
                     %(prop_id)s,
-                    %(floor_plan_id)s,
+                    %(floorplan_id)s,
                     %(unit_number)s,
                     %(floor_number)s,
                     %(building_name)s,
@@ -257,7 +257,7 @@ class PostgresPipeline:
                 ON CONFLICT (property_id, unit_number) DO NOTHING 
                 RETURNING unit_id
             )
-            SELECT floor_plan_id FROM upsert
+            SELECT unit_id FROM upsert
             UNION
                 SELECT unit_id
                 FROM apartment_units
@@ -270,7 +270,7 @@ class PostgresPipeline:
             sql,
             {
                 "prop_id": property_id,
-                "floor_plan_id": floor_plan_id,
+                "floorplan_id": floorplan_id,
                 "unit_number": item.get("unit_number"),
                 "floor_number": item.get("floor_number"),
                 "building_name": item.get("building_name"),
@@ -312,7 +312,7 @@ class PostgresPipeline:
         )
 
     def _insert_promo(self, item: PromoItem) -> int:
-        # SQL logic, often using ON CONFLICT to retrieve the existing floor_plan_id
+        # SQL logic, often using ON CONFLICT to retrieve the existing floorplan_id
         # and cache it, so the ApartmentUnitItem can use it later.
         raise NotImplementedError("Method not yet implemented.")
 

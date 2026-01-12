@@ -1,12 +1,18 @@
+from __future__ import annotations
+
+import scrapy
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from scrapy_playwright.page import PageMethod
 from Leverage.items import UnitItem, PromoItem
 from Leverage.spiders.spider import ConfigurableSpider
-from typing import Generator, List
 
-import scrapy
-import json
+from typing import TYPE_CHECKING, Generator
+
+if TYPE_CHECKING:
+    from scrapy.http import Response
+    from twisted.python.failure import Failure
 
 
 class UDRSpider(ConfigurableSpider):
@@ -15,7 +21,7 @@ class UDRSpider(ConfigurableSpider):
     """
 
     name: str = "udr"
-    start_urls: List[str] = []
+    start_urls: list[str] = []
 
     VIEWMODEL_VARIABLE_TEXT = "window.udr.jsonObjPropertyViewModel"
 
@@ -40,7 +46,7 @@ class UDRSpider(ConfigurableSpider):
                 errback=self.handle_error,
             )
 
-    def parse(self, response):
+    def parse(self, response: Response) -> Generator[UnitItem | PromoItem, None, None]:
         self.logger.info("Saving initial page content.")
         filename = f"output/{self.name}_page_loaded.html"
         Path(filename).write_bytes(response.body)
@@ -72,24 +78,27 @@ class UDRSpider(ConfigurableSpider):
         json_data = json.loads(view_model_json)
         # json.dump(json_data, open(f"output/{self.name}_viewmodel.json", "w"), indent=2)
 
-        scraped_time = datetime.now(timezone.utc).isoformat()
+        scraped_at = datetime.now(timezone.utc).isoformat()
 
         # Parse data
-        yield from self.parse_specials(json_data)
-        yield from self.parse_floorplans(json_data)
+        for promo in self.parse_specials(json_data):
+            promo["scraped_at"] = scraped_at
+            yield promo
 
-    def parse_specials(
-        self, json_data: dict, scraped_time=datetime
-    ) -> Generator[PromoItem, None, None]:
+        for unit in self.parse_floorplans(json_data):
+            unit["scraped_at"] = scraped_at
+            unit["property_url"] = response.url
+            yield unit
+
+    def parse_specials(self, json_data: dict) -> Generator[PromoItem, None, None]:
         """Parse specials from view model"""
         specials = json_data.get("allSpecials", [])
         for special in specials:
             yield PromoItem(
-                scraped_at=scraped_time,
-                property_id=special.get("propertyId"),
+                # property_id=special.get("propertyId"),
                 ext_floorplan_id=special.get("floorplanId"),
                 ext_promo_id=special.get("id"),
-                specials_text=special.get("content"),
+                text=special.get("content"),
                 has_available_units=special.get("hasAvailableUnits"),
             )
 
@@ -102,7 +111,6 @@ class UDRSpider(ConfigurableSpider):
                 # TODO?: consider using ItemLoader
                 item = UnitItem()
 
-                # TODO: come back to this and fill out more fields
                 # Price info
                 item["rent_usd"] = listing.get("rent")
                 item["deposit_usd"] = listing.get("deposit")
@@ -126,13 +134,15 @@ class UDRSpider(ConfigurableSpider):
                 item["num_bedrooms"] = listing.get("bedrooms")
                 item["num_bathrooms"] = listing.get("bathrooms")
                 item["square_footage"] = listing.get("sqFt")
+
+                # Identifiers
                 item["unit_number"] = listing.get("marketingName")
 
                 yield item
 
-    async def handle_error(self, failure):
+    async def handle_error(self, failure: Failure) -> None:
         try:
-            page = failure.request.meta["playwright_page"]
+            page = failure.request.meta["playwright_page"]  # type: ignore[attr-defined]
             await page.close()
         except Exception as e:
             self.logger.error(f"Error closing Playwright page: {e}")

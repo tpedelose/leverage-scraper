@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 import scrapy
 from pathlib import Path
-from urllib.parse import urljoin
 from Leverage.items import PropertyItem
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scrapy.http import Response
 
 
 class UDRPropertyIndexer(scrapy.Spider):
@@ -18,7 +24,7 @@ class UDRPropertyIndexer(scrapy.Spider):
         for url in self.start_urls:
             yield scrapy.Request(url=url)
 
-    def parse(self, response):
+    def parse(self, response: Response):
         self.logger.info("Saving initial page content.")
         filename = f"output/{self.name}_page_loaded.html"
         Path(filename).write_bytes(response.body)
@@ -33,17 +39,28 @@ class UDRPropertyIndexer(scrapy.Spider):
                 callback=self.parse_location_page,
             )
 
-    def parse_location_page(self, response):
+    def parse_location_page(self, response: Response):
         self.logger.info(f"Parsing location page: {response.url}")
-        import usaddress
 
         cards = response.css(".community-card")
         for card in cards:
             property_link = card.css("a.community-card__title::attr(href)").get()
+            if not property_link:
+                self.logger.warning("No property link found for community card.")
+                continue
+
             city_state_zip = card.css(".community-card__city-state::text").get()
+            if not city_state_zip:
+                self.logger.warning("No city/state/zip found for community card.")
+                continue
+
             # TODO: consider switch to `usaddress` parsing
             city, state_zip = city_state_zip.split(", ")
             state, zip_code = state_zip.split(" ")
+
+            apt_list_url = response.urljoin(
+                "/".join([property_link, "apartments-pricing"]).replace("//", "/")
+            )
 
             yield PropertyItem(
                 company_name=self.company_name,
@@ -52,8 +69,6 @@ class UDRPropertyIndexer(scrapy.Spider):
                 city=city,
                 state=state,
                 postal_code=zip_code,
-                template_engine="udr",  # TODO: make configurable
-                url=response.urljoin(
-                    "/".join([property_link, "apartments-pricing"]).replace("//", "/")
-                ),
+                template_engine="udr",
+                url=apt_list_url,
             )

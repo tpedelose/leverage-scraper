@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import re
 import scrapy
@@ -5,9 +7,13 @@ import unicodedata
 import usaddress
 from pathlib import Path
 from scrapy.http import Response
-from urllib.parse import urljoin
 from Leverage.spiders.utils import determine_template_engine
 from Leverage.items import PropertyItem
+
+from typing import TYPE_CHECKING, Generator
+
+if TYPE_CHECKING:
+    from scrapy.http import Response
 
 
 class DolbenPropertyIndexer(scrapy.Spider):
@@ -37,7 +43,7 @@ class DolbenPropertyIndexer(scrapy.Spider):
         for url in self.start_urls:
             yield scrapy.Request(url=url)
 
-    def parse(self, response):
+    def parse(self, response: Response):
         self.logger.info("Saving initial page content.")
         filename = f"output/{self.name}_page_loaded.html"
         Path(filename).write_bytes(response.body)
@@ -76,7 +82,9 @@ class DolbenPropertyIndexer(scrapy.Spider):
 
         return metadata
 
-    def parse_property_page(self, response):
+    def parse_property_page(
+        self, response: Response
+    ) -> Generator[PropertyItem, None, None]:
         self.logger.info(f"Parsing property page: {response.url}")
 
         template_engine = determine_template_engine(response)
@@ -116,18 +124,16 @@ class DolbenPropertyIndexer(scrapy.Spider):
             # TODO: Merge more intelligently (e.g. only fill in missing fields?)
             address_data = {**address_data, **footer_address}
 
-        # TODO: Some properties need more work on gathering State/region (gather from index page?)
-
         match template_engine:
             case "repli360":
-                apt_list_url = urljoin(response.url, "floor-plans/")
+                apt_list_url = response.urljoin("floor-plans/")
             case "bespark":
-                apt_list_url = urljoin(
-                    response.url, f"{Path(response.url).name}-floor-plans/"
+                apt_list_url = response.urljoin(
+                    f"{Path(response.url).name}-floor-plans/"
                 )
             case _:
                 # TODO: Something to handle unknown template engines
-                apt_list_url = urljoin(response.url, "floor-plans/")
+                apt_list_url = response.urljoin("floor-plans/")
 
         # NOTE! Bespark uses RentPress for apartment listings.
 
@@ -233,6 +239,6 @@ class DolbenPropertyIndexer(scrapy.Spider):
         # besparkliving.com properties : completely different footer format
         raise NotImplementedError("Method not yet implemented.")
 
-    def find_apartment_list_page(self, response):
+    def find_apartment_list_page(self, response: Response) -> str:
         # Sites have a specific page for apartment listings, find its URL
         raise NotImplementedError("Method not yet implemented.")
