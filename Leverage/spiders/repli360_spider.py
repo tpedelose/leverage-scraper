@@ -1,45 +1,56 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import scrapy
 from datetime import datetime, timezone
-from pathlib import Path
+from scrapy import Selector
 from scrapy_playwright.page import PageMethod
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from urllib.parse import parse_qs, urlsplit
 from Leverage.items import UnitItem, PromoItem
-from Leverage.spiders.spider import ConfigurableSpider
+from Leverage.spiders.spider import ContentBlockerSpider
 
 from typing import TYPE_CHECKING, AsyncGenerator
 
 if TYPE_CHECKING:
     from scrapy.http import Response
     from playwright.async_api import Page
-    from scrapy import Selector
     from twisted.python.failure import Failure
 
 
 APT_DETAILS_LABEL_MAP = {
     # Price info
-    "rent_usd": "Starting At",
-    "deposit_usd": "Deposit",
+    "rent_usd": ["Starting At", "Total Monthly Leasing Price Starting At"],
+    "deposit_usd": ["Deposit"],
     # Availability
-    "available_date": "Availability",
+    "available_date": ["Availability"],
     # Floor Plan Metadata
-    "building_id": "Building Number",
-    "unit_number": "Unit Number",
+    "building_name": ["Building Number"],
+    "unit_number": ["Unit Number"],
 }
 
 
-class Repli360Spider(ConfigurableSpider):
+class Repli360Spider(ContentBlockerSpider):
     """
     Spider to scrape apartment listings from websites using the Repli360 template engine.
     """
 
+    custom_settings = {
+        # TODO: Find way to speed this up. Seems to be some rate-limiting going on.
+        "CONCURRENT_REQUESTS": 1,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+        # "PLAYWRIGHT_MAX_PAGES_PER_CONTEXT": 4,
+    }
+
     name: str = "repli360"
     start_urls: list[str] = []
 
+    blocked_resource_types = set(["font", "image", "media"])
+
     POPUP_CLOSE_BUTTON_SELECTOR = ".dmPopupClose"
     APT_DETAILS_TABLE_SELECTOR = "#fp_table1"
+    APT_MODAL_SELECTOR = ".rrac_apartment_details"
 
     async def start(self):
         for url in self.start_urls:
@@ -49,23 +60,23 @@ class Repli360Spider(ConfigurableSpider):
                     "playwright": True,
                     "playwright_include_page": True,
                     "playwright_page_methods": [
+                        # Block unnecessary resources
+                        PageMethod(
+                            "route",
+                            url="**/*",
+                            handler=self.route_handler,
+                        ),
                         # Ensure the main content is loaded
                         PageMethod("wait_for_load_state", "networkidle"),
-                        # Close pop-up modal if it appears
-                        PageMethod("wait_for_timeout", 1000),
                         # Wait a moment for the popup to appear
                         PageMethod(
-                            "wait_for_selector", self.POPUP_CLOSE_BUTTON_SELECTOR
+                            "wait_for_selector",
+                            self.POPUP_CLOSE_BUTTON_SELECTOR,
                         ),
+                        # Close pop-up modal if it appears
                         PageMethod("click", self.POPUP_CLOSE_BUTTON_SELECTOR),
-                        # Wait for the dynamic content to load
+                        # Ensure the apartment listings tab is loaded
                         PageMethod("wait_for_selector", "#all_available_tab"),
-                        # Take a screenshot after page load (for debugging purposes)
-                        PageMethod(
-                            "screenshot",
-                            path=Path(f"output/{self.name}_page_loaded.png"),
-                            full_page=True,
-                        ),
                     ],
                 },
                 errback=self.handle_error,
@@ -74,10 +85,6 @@ class Repli360Spider(ConfigurableSpider):
     async def parse(
         self, response: Response
     ) -> AsyncGenerator[UnitItem | PromoItem, None]:
-        self.logger.info("Saving initial page content.")
-        filename = f"output/{self.name}_page_loaded.html"
-        Path(filename).write_bytes(response.body)
-
         yield self.parse_specials(response)
         async for apt in self.parse_floorplans(response):
             apt["property_url"] = response.url
@@ -95,14 +102,58 @@ class Repli360Spider(ConfigurableSpider):
             property_url=response.url,
         )
 
-    # small helper to avoid repeating click+wait logic
     async def _click_and_wait(
-        self, page: Page, click_selector: str, wait_selector: str, visible: bool = True
-    ):
-        await page.click(click_selector)
-        await page.wait_for_timeout(500)  # 500 ms delay to allow for animations
+        self,
+        page: Page,
+        click_selector: str,
+        wait_selector: str,
+        visible: bool = True,
+        retries: int = 2,
+        timeout: int = 30000,
+    ) -> None:
+        """Click a selector and wait for a DOM selector to become visible/hidden."""
+
+        if await page.locator(click_selector).count() == 0:
+            raise ValueError(f"Click selector '{click_selector}' not found on page.")
+
+        try:
+            await page.locator(click_selector).first.click()
+        except PlaywrightTimeoutError as e:
+            self.logger.debug(
+                f"Initial click timeout for {click_selector} on page {page.url}: {e}"
+            )
+
+        total_tries = retries + 1  # initial try + retries
         state = "visible" if visible else "hidden"
-        await page.wait_for_selector(wait_selector, state=state)
+
+        for attempt in range(1, total_tries + 1):
+            exp_time = timeout * (2 ** (attempt - 1))  # exponential backoff
+
+            try:
+                # If a DOM selector is provided, wait for it
+                await page.locator(wait_selector).first.wait_for(
+                    state=state, timeout=exp_time
+                )
+                return
+            except PlaywrightTimeoutError as e:
+                self.logger.debug(
+                    f"Playwright timeout during click (page {page.url}, attempt {attempt}): {e}"
+                )
+                if attempt >= retries:
+                    self.logger.warning(
+                        f"Final retry exhausted for _click_and_wait after timeout. Page: {page.url} (click: {click_selector} -> wait for: {wait_selector})"
+                    )
+                    raise e
+
+            except Exception as e:
+                self.logger.error(f"Error in _click_and_wait (attempt {attempt}): {e}")
+                if attempt >= retries:
+                    return
+
+            # If we've reached here and there are remaining attempts, pause and retry.
+            if attempt < retries:
+                await page.wait_for_timeout(150)
+                continue
 
     def parse_apartment_listing(self, selector: Selector) -> UnitItem:
         """
@@ -111,10 +162,12 @@ class Repli360Spider(ConfigurableSpider):
         """
         item = UnitItem()
 
-        for field_key, label_text in APT_DETAILS_LABEL_MAP.items():
-            value = self._get_apt_data_by_label(selector, label_text)
-            if value is not None:
-                item[field_key] = value
+        for field_key, label_texts in APT_DETAILS_LABEL_MAP.items():
+            for label_text in label_texts:
+                value = self._get_apt_data_by_label(selector, label_text)
+                if value is not None:
+                    item[field_key] = value
+                    break  # Stop after finding the first matching label
 
         lease_link = selector.css('a[id^="goto_lease_"]::attr(href)').get()
         if lease_link and "?" in lease_link:
@@ -138,35 +191,38 @@ class Repli360Spider(ConfigurableSpider):
         for floorplan in floorplans:
             # Click the anchor to load the floor plan details
             floorplan_id = floorplan.attrib.get("data-id")
-            anchor_selector = f'.rracFloorplan[data-id="{floorplan_id}"] .right-cta a'
-            await self._click_and_wait(
-                page, anchor_selector, self.APT_DETAILS_TABLE_SELECTOR, visible=True
-            )
+            if not floorplan_id:
+                self.logger.warning("Floorplan missing data-id attribute, skipping.")
+                continue
 
-            # Get the updated HTML content after dynamic loading
-            new_response = response.replace(
-                body=await page.content(), url=page.url, encoding="utf-8"
-            )
+            # Get from request directly to avoid timing issues with dynamic content
+            anchor_selector = f'#all_available_tab .rracFloorplan[data-id="{floorplan_id}"] .right-cta a'
+            async with page.expect_response("**/admin/getUnitListByFloor") as resp_info:
+                await page.locator(anchor_selector).first.click()
+
+            api_response = await resp_info.value
+            data = await api_response.json()
+
             # Track scrape time after dynamic content has loaded
-            scraped_at_utc = datetime.now(timezone.utc).isoformat()
+            scraped_dt = datetime.now(timezone.utc)
+            today = scraped_dt.date()
 
-            apartment_rows = new_response.css(
+            # Turn the returned HTML table into a Scrapy Selector for parsing
+            html_response = data.get("str")
+            table_sel = Selector(text=html_response)
+            apartment_rows = table_sel.css(
                 f"{self.APT_DETAILS_TABLE_SELECTOR} tr.unitlisting"
             )
             self.logger.info(f"Found {len(apartment_rows)} apartment listings.")
 
-            # Get bathroom info from floorplan details if available
-            # Pattern of text is usually "One Bedroom | 1 Bath |"
+            # Get bath info from details, pattern usually "One Bedroom | 1 Bath |"
             floorplan_details = floorplan.css(".decp p::text").get()
             num_bathrooms = None
             if floorplan_details:
                 bath_match = re.search(r"(\d+(\.\d+)?)\s*Bath", floorplan_details)
                 if bath_match:
                     num_bathrooms = bath_match.group(1)
-
-            today = datetime.now(timezone.utc).date()
             for row in apartment_rows:
-                # TODO: Switch to updating items with
                 listing = self.parse_apartment_listing(row)
 
                 # Clean and process availability info
@@ -186,7 +242,7 @@ class Repli360Spider(ConfigurableSpider):
                 listing["is_available"] = is_available
 
                 # Add floorplan-level metadata
-                listing["scraped_at"] = scraped_at_utc
+                listing["scraped_at"] = scraped_dt.isoformat()
                 listing["floorplan_name"] = floorplan.attrib.get("data-fpname")
                 listing["floorplan_id"] = floorplan.attrib.get("data-id")
                 listing["num_bedrooms"] = floorplan.attrib.get("data-bed")
@@ -195,14 +251,18 @@ class Repli360Spider(ConfigurableSpider):
                 yield listing
 
             # close and restore state
-            apt_details_close_selector = ".rrac_galleryClose"
-
             await self._click_and_wait(
                 page,
-                apt_details_close_selector,
-                self.APT_DETAILS_TABLE_SELECTOR,
+                "#rrac_apartment_details .rrac_galleryClose",
+                self.APT_MODAL_SELECTOR,
                 visible=False,
             )
+
+            # brief pause before next iteration to avoid rate limiting
+            await asyncio.sleep(0.25)
+
+        # Make sure to close the page to avoid hangs
+        await page.close()
 
     def _get_apt_data_by_label(
         self, row_selector: Selector, label_text: str
@@ -221,17 +281,27 @@ class Repli360Spider(ConfigurableSpider):
             self.logger.debug(f"Label '{label_text}' not found in row.")
             return
 
-        # Try to find direct text nodes of the <td>, ingoring child elements
+        # Find direct text nodes of the <td>, ingoring child elements
         value_nodes = cell.xpath("./text()[normalize-space()]").getall()
+
+        # If there's a rent matrix link, prefer direct text of <span> with class
+        # TODO: (later) Scrape the full rent matrix
+        if not value_nodes:
+            value_nodes = cell.xpath(
+                ".//span[contains(@class, 'term_plan_matrix_wrapper')]/text()"
+            ).getall()
+
+        # Join all direct text nodes and clean them up
         if value_nodes:
-            # Join all direct text nodes and clean them up
             return " ".join(value_nodes).strip().strip("$").replace(",", "")
 
-        # If no direct text was found, find text inside a child element
+        # If no direct text or matrix span was found, find text inside a child element
         # that is NOT the <span> label.
         value = cell.xpath("./*[not(self::span)]//text()").get()
         if value:
             return value.strip()
+
+        return None
 
     async def handle_error(self, failure: Failure) -> None:
         try:

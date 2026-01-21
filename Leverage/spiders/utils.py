@@ -1,5 +1,11 @@
-from scrapy.http import Response
+from __future__ import annotations
+
 from urllib.parse import urlparse
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scrapy.http import Response
 
 
 TEMPLATE_ENGINE_MAP = {

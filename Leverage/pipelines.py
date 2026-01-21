@@ -254,7 +254,7 @@ class PostgresPipeline:
                     %(building_name)s,
                     %(is_on_top_floor)s
                 )
-                ON CONFLICT (property_id, unit_number) DO NOTHING 
+                ON CONFLICT (property_id, building_name, unit_number) DO NOTHING 
                 RETURNING unit_id
             )
             SELECT unit_id FROM upsert
@@ -263,6 +263,7 @@ class PostgresPipeline:
                 FROM apartment_units
                 WHERE (
                     property_id = %(prop_id)s 
+                    AND building_name = %(building_name)s
                     AND unit_number = %(unit_number)s
                 );
         """
@@ -295,9 +296,10 @@ class PostgresPipeline:
                 rent_usd,
                 deposit_usd,
                 min_lease_term_months,
+                is_available,
                 available_date
             )
-            VALUES (%s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         self.cur.execute(
             sql,
@@ -307,6 +309,7 @@ class PostgresPipeline:
                 item.get("rent_usd"),
                 item.get("deposit_usd"),
                 item.get("min_lease_term_months"),
+                item.get("is_available"),
                 item.get("available_date"),
             ),
         )

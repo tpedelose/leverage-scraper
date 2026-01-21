@@ -3,26 +3,32 @@ from __future__ import annotations
 import scrapy
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from scrapy_playwright.page import PageMethod
 from Leverage.items import UnitItem, PromoItem
-from Leverage.spiders.spider import ConfigurableSpider
+from Leverage.spiders.spider import ContentBlockerSpider, DatabaseSpider
 
 from typing import TYPE_CHECKING, Generator
 
 if TYPE_CHECKING:
     from scrapy.http import Response
-    from twisted.python.failure import Failure
 
 
-class UDRSpider(ConfigurableSpider):
+class UDRSpider(DatabaseSpider, ContentBlockerSpider):
     """
     Spider to scrape apartment listings from UDR properties.
     """
 
     name: str = "udr"
-    start_urls: list[str] = []
 
+    blocked_resource_types = set(["font", "image", "media"])
+    blocked_domains = set(
+        [
+            "*://*.sierra.chat/*",
+            "*://*.nestiolistings.com/*",
+        ]
+    )
+
+    COMPANY_ID = 2  # Company ID in DB
     VIEWMODEL_VARIABLE_TEXT = "window.udr.jsonObjPropertyViewModel"
 
     async def start(self):
@@ -31,26 +37,20 @@ class UDRSpider(ConfigurableSpider):
                 url=url,
                 meta={
                     "playwright": True,
-                    "playwright_include_page": True,
                     "playwright_page_methods": [
+                        # Block unnecessary resources
+                        PageMethod(
+                            "route",
+                            url="**/*",
+                            handler=self.route_handler,
+                        ),
                         # Ensure the main content is loaded
                         PageMethod("wait_for_load_state", "networkidle"),
-                        # Take a screenshot after page load (for debugging purposes)
-                        PageMethod(
-                            "screenshot",
-                            path=Path(f"output/{self.name}_page_loaded.png"),
-                            full_page=True,
-                        ),
                     ],
                 },
-                errback=self.handle_error,
             )
 
     def parse(self, response: Response) -> Generator[UnitItem | PromoItem, None, None]:
-        self.logger.info("Saving initial page content.")
-        filename = f"output/{self.name}_page_loaded.html"
-        Path(filename).write_bytes(response.body)
-
         # Template has a view model embedded in a script tag in the head. We'll take that.
         script_content = response.xpath(
             f"//script[contains(., '{self.VIEWMODEL_VARIABLE_TEXT}')]/text()"
@@ -76,8 +76,6 @@ class UDRSpider(ConfigurableSpider):
             .removeprefix(f"{self.VIEWMODEL_VARIABLE_TEXT} = ")
         )
         json_data = json.loads(view_model_json)
-        # json.dump(json_data, open(f"output/{self.name}_viewmodel.json", "w"), indent=2)
-
         scraped_at = datetime.now(timezone.utc).isoformat()
 
         # Parse data
@@ -119,12 +117,20 @@ class UDRSpider(ConfigurableSpider):
 
                 # Availability
                 # TODO: Multiple "date available" items, not sure which is correct
-                item["available_date"] = listing.get("earliestMoveInDate")
+                available_date = listing.get("earliestMoveInDate")
+                if available_date:  # TODO? Try-except for parse errors?
+                    available_date = (
+                        self.parse_date_str(available_date).date().isoformat()
+                    )
+                item["available_date"] = available_date
                 item["is_available"] = listing.get("isAvailable")
                 item["min_lease_term_months"] = listing.get("leaseTerm")
 
                 # Location
-                item["building_name"] = listing.get("building")
+                building_name = listing.get("building")
+                if building_name == "N/A":
+                    building_name = None
+                item["building_name"] = building_name
                 item["floor_number"] = listing.get("floorNumber")
                 item["top_floor"] = listing.get("IsOnTopFloor")
 
@@ -140,9 +146,19 @@ class UDRSpider(ConfigurableSpider):
 
                 yield item
 
-    async def handle_error(self, failure: Failure) -> None:
-        try:
-            page = failure.request.meta["playwright_page"]  # type: ignore[attr-defined]
-            await page.close()
-        except Exception as e:
-            self.logger.error(f"Error closing Playwright page: {e}")
+    def parse_date_str(self, date_str: str) -> datetime:
+        # Expect strings like: "/Date(1773446400000+0000)/", "/Date(1773446400000)/",
+
+        # Strip prefix/suffix
+        date_str = date_str.removeprefix("/Date(").removesuffix(")/")
+
+        # Split off timezone if present
+        timestamp_str = date_str
+        if "+" in date_str:
+            timestamp_str, _ = date_str.split("+", 1)
+
+        # TODO? Check if in milliseconds
+        # Assume milliseconds for now
+        ts_str = int(timestamp_str) / 1000
+        dt = datetime.fromtimestamp(ts_str, tz=timezone.utc)
+        return dt
