@@ -1,4 +1,4 @@
-from Leverage.spiders.repli360_spider import Repli360Spider
+from Leverage.spiders.crawlers.repli360_spider import Repli360Spider
 from Leverage.spiders.spider import DatabaseSpider
 
 

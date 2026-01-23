@@ -12,7 +12,7 @@ import os
 
 BOT_NAME = "Leverage"
 
-SPIDER_MODULES = ["Leverage.spiders"]
+SPIDER_MODULES = ["Leverage.spiders.crawlers", "Leverage.spiders.indexers"]
 NEWSPIDER_MODULE = "Leverage.spiders"
 
 ADDONS = {}
