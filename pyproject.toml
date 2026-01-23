@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "playwright>=1.55.0",
+    "psycopg>=3.3.2",
     "psycopg2-binary>=2.9.11",
+    "python-dotenv>=1.2.1",
     "scrapy>=2.13.3",
     "scrapy-playwright>=0.0.44",
     "scrapyd>=1.6.0",

@@ -2,127 +2,91 @@
 #
 # Don't forget to add your pipeline to the ITEM_PIPELINES setting
 # See: https://docs.scrapy.org/en/latest/topics/item-pipeline.html
-
-from Leverage.items import UnitItem, PromoItem, PropertyItem
+from __future__ import annotations
 
 import json
-import psycopg2
+import psycopg
 import logging
+import psycopg2
 
-from scrapy import Spider, Item
-from scrapy.crawler import Crawler
+from Leverage.items import UnitItem, PromoItem, PropertyItem
+from psycopg import Rollback
 from scrapy.exceptions import DropItem
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scrapy import Spider, Item
+    from scrapy.crawler import Crawler
+    from psycopg import Cursor
 
 
-class JsonPipeline:
-    logger = logging.getLogger(__name__)
-    pretty_print = True
-
-    def open_spider(self, spider):
-        self.file = open("items.jl", "w")
-
-    def close_spider(self, spider):
-        self.file.close()
-
-    def process_item(self, item, spider):
-        match self.pretty_print:
-            case True:
-                line = json.dumps(dict(item), indent=2) + "\n"
-            case False:
-                line = json.dumps(dict(item)) + "\n"
-        self.file.write(line)
-        return item
-
-
-class PostgresPipeline:
+class PostgresConnectionPipeline:
     logger = logging.getLogger(__name__)
 
-    def __init__(self, db_settings):
-        self.db_config = db_settings
-        self.conn = psycopg2.connect(**self.db_config)
-        self.cur = self.conn.cursor()
+    def __init__(self, db_dsn: str):
+        self.db_dsn = db_dsn
+        self.conn = None
 
     @classmethod
     def from_crawler(cls, crawler: Crawler):
-        db_settings = crawler.settings.getdict("DATABASE_CONFIG")
-        return cls(db_settings)
+        db_dsn: str = crawler.settings.get("DB_DSN")
+        cls.logger.info(f"PostgresConnectionPipeline using DSN: {db_dsn}")
+        if not db_dsn:
+            raise ValueError(
+                "DB_DSN setting is required for PostgresConnectionPipeline."
+            )
+        return cls(db_dsn)
 
     def open_spider(self, spider: Spider):
-        # Establish the connection when the spider starts
-        try:
-            if not self.conn or self.conn.closed:
-                self.conn = psycopg2.connect(**self.db_config)
-                self.conn.autocommit = False  # Ensure transactions are used
-            if not self.cur or self.cur.closed:
-                self.cur = self.conn.cursor()
-            spider.logger.info("Successfully connected to PostgreSQL.")
-        except psycopg2.Error as e:
-            spider.logger.error(f"PostgreSQL connection failed: {e}")
-            raise e
+        self.conn = psycopg.connect(self.db_dsn)
+        # expose connection so other pipelines can use it
+        spider.crawler.postgres_conn = self.conn
+        spider.logger.info("Postgres connection opened.")
 
     def close_spider(self, spider: Spider):
-        # Commit any remaining transactions and close the connection
-        if self.conn:
-            self.conn.commit()
-            if self.cur:
-                self.cur.close()
-            self.conn.close()
+        conn = getattr(spider.crawler, "postgres_conn", None)
+        if conn:
+            conn.close()
+            del spider.crawler.postgres_conn
 
-    def process_item(self, item: Item, spider: Spider):
-        try:
-            match item:
-                case PropertyItem():
-                    self.logger.info("Processing PropertyItem...")
-                    company_name = item.get("company_name")
-                    if not company_name:
-                        raise DropItem("PropertyItem missing company_url field.")
-                    company_name = self._get_company_id(company_name)
-                    property_id = self._upsert_property(item, company_name)
 
-                case UnitItem():
-                    self.logger.info("Processing UnitItem...")
-                    try:
-                        url = spider.start_urls[0]
-                        self.logger.debug(url)
-                        # TODO: Pass Item property_url field from spider to here to avoid issues with multiple start URLs
-                    except IndexError:
-                        raise DropItem(
-                            "No start URL found in spider to determine property."
-                        )
+class PropertyItemPipeline:
+    logger = logging.getLogger(__name__)
 
-                    property_id = self._get_property_id(url)
-                    self.process_unit_item(item, property_id)
+    def process_item(self, item: Item, spider: Spider) -> Item:
+        if not isinstance(item, PropertyItem):
+            return item  # Pass through other item types
 
-                case PromoItem():
-                    self.logger.info("Processing PromoItem...")
-                    # self._insert_promo(item)
-                    pass
+        conn = getattr(spider.crawler, "postgres_conn", None)
+        if not conn:
+            raise ValueError("No PostgreSQL connection available in spider.")
 
-                case _:
-                    pass  # Allow other items to pass
+        self.logger.info("Processing PropertyItem...")
+        company_name = item.get("company_name")
+        if not company_name:
+            # TODO: Should I pass item through for potential later use?
+            raise DropItem("PropertyItem missing company_url field.")
 
-        except Exception as e:
-            raise DropItem(f"Error processing item: {e}")
+        with conn.cursor() as cur:
+            company_name = self.get_company_id(cur, company_name)
+            _ = self.upsert_property(cur, item, company_name)
 
         return item
 
-    def process_unit_item(self, item: UnitItem, property_id: int):
-        try:
-            self.cur.execute("BEGIN;")
-            floorplan_id = self._upsert_floorplan(item, property_id)
-            unit_id = self._upsert_apartment_unit(item, property_id, floorplan_id)
-            self._insert_price_history(item, unit_id)
-            self.conn.commit()
+    def get_company_id(self, cur: Cursor, company_name: str) -> int:
+        sql = "SELECT company_id FROM management_companies WHERE name = %s;"
+        cur.execute(sql, (company_name,))
+        result = cur.fetchone()
+        if not result:
+            raise ValueError(
+                f"Failed to retrieve company_id for company_name={company_name}"
+            )
+        return result[0]
 
-        except Exception as e:
-            self.logger.error(f"Transaction failed: {e}")
-            self.conn.rollback()  # Roll back all changes if any step fails
-            raise e
-
-    def _upsert_property(self, item: PropertyItem, company_id: int) -> int:
+    def upsert_property(self, cur: Cursor, item: PropertyItem, company_id: int) -> int:
         # Use a property URL or a combined City/Name as the ON CONFLICT target
         # TODO! Update primary key to something beyond the URL alone
-        sql = """
+        query = """
             INSERT INTO properties (
                 company_id,
                 property_name,
@@ -159,33 +123,74 @@ class PostgresPipeline:
         # NOTE: PostgreSQL increments the counter on GENERATED ALWAYS AS IDENTITY columns on every insert attempt,
         # even if the insert fails due to a conflict. This is expected behavior.
 
-        self.cur.execute(
-            sql,
-            {
-                "company_id": company_id,
-                "name": item.get("property_name"),
-                "url": item.get("url"),
-                "template": item.get("template_engine"),
-                "address": item.get("address"),
-                "city": item.get("city"),
-                "state": item.get("state"),
-                "postal_code": item.get("postal_code"),
-            },
-        )
+        data = {
+            "company_id": company_id,
+            "name": item.get("property_name"),
+            "url": item.get("url"),
+            "template": item.get("template_engine"),
+            "address": item.get("address"),
+            "city": item.get("city"),
+            "state": item.get("state"),
+            "postal_code": item.get("postal_code"),
+        }
 
-        result = self.cur.fetchone()
+        cur.execute(query, data)
+        result = cur.fetchone()
         if not result:
-            raise ValueError(
-                f"Failed to upsert property with URL={item.get('property_url')}"
-            )
+            raise ValueError(f"Failed to upsert property with URL={data['url']}")
 
         self.logger.info(f"Upserted property_id: {result[0]}")
         return result[0]
 
-    def _upsert_floorplan(self, item: UnitItem, property_id: int) -> int:
+
+class UnitItemPipeline:
+    logger = logging.getLogger(__name__)
+
+    def process_item(self, item: Item, spider: Spider):
+        if not isinstance(item, UnitItem):
+            return item  # Pass through other item types
+
+        conn = getattr(spider.crawler, "postgres_conn", None)
+        if not conn:
+            raise ValueError("No PostgreSQL connection available in spider.")
+
+        self.logger.info("Processing UnitItem...")
+        url = item.get("property_url")
+        if not url:
+            # TODO: Should I pass item through for potential later use?
+            raise DropItem("No property URL in UnitItem.")
+
+        with conn.cursor() as cur:
+            property_id = self.get_property_id(cur, url)
+
+            with conn.transaction():
+                try:
+                    floorplan_id = self.upsert_floorplan(cur, item, property_id)
+                    unit_id = self.upsert_apartment_unit(
+                        cur, item, property_id, floorplan_id
+                    )
+                    self.insert_price_history(cur, item, unit_id)
+
+                except Exception as e:
+                    self.logger.error(f"Transaction failed: {e}")
+                    Rollback()  # Roll back all changes if any step fails
+                    raise e
+
+        return item
+
+    def get_property_id(self, cur: Cursor, url: str) -> int:
+        # SQL logic to retrieve property_id based on a natural key
+        sql_select = "SELECT property_id FROM properties WHERE url = %s;"
+        cur.execute(sql_select, (url,))
+        result = cur.fetchone()
+        if not result:
+            raise ValueError(f"Failed to retrieve property_id for url={url}")
+        return result[0]
+
+    def upsert_floorplan(self, cur: Cursor, item: UnitItem, property_id: int) -> int:
         # TODO: Consider if DO UPDATE is needed here to update metadata
         # Check out this: https://stackoverflow.com/questions/34708509/how-to-use-returning-with-on-conflict-in-postgresql
-        sql = """
+        query = """
             WITH upsert AS (
                 INSERT INTO floorplans (
                     property_id,
@@ -213,18 +218,17 @@ class PostgresPipeline:
                     AND plan_name = %(plan_name)s
                 );
         """
-        self.cur.execute(
-            sql,
-            {
-                "prop_id": property_id,
-                "plan_name": item.get("floorplan_name"),
-                "bedrooms": item.get("num_bedrooms"),
-                "bathrooms": item.get("num_bathrooms"),
-                "square_footage": item.get("square_footage"),
-            },
-        )
 
-        result = self.cur.fetchone()
+        data = {
+            "prop_id": property_id,
+            "plan_name": item.get("floorplan_name"),
+            "bedrooms": item.get("num_bedrooms"),
+            "bathrooms": item.get("num_bathrooms"),
+            "square_footage": item.get("square_footage"),
+        }
+
+        cur.execute(query, data)
+        result = cur.fetchone()
         if not result:
             raise ValueError(
                 f"Failed to retrieve floorplan_id for property_id={property_id} and plan_name={item.get('floorplan_name')}"
@@ -233,10 +237,10 @@ class PostgresPipeline:
         self.logger.info(f"Upserted floorplan_id: {result[0]}")
         return result[0]
 
-    def _upsert_apartment_unit(
-        self, item: UnitItem, property_id: int, floorplan_id: int
+    def upsert_apartment_unit(
+        self, cur: Cursor, item: UnitItem, property_id: int, floorplan_id: int
     ) -> int:
-        sql = """
+        query = """
             WITH upsert AS(
                 INSERT INTO apartment_units (
                     property_id,
@@ -267,19 +271,18 @@ class PostgresPipeline:
                     AND unit_number = %(unit_number)s
                 );
         """
-        self.cur.execute(
-            sql,
-            {
-                "prop_id": property_id,
-                "floorplan_id": floorplan_id,
-                "unit_number": item.get("unit_number"),
-                "floor_number": item.get("floor_number"),
-                "building_name": item.get("building_name"),
-                "is_on_top_floor": item.get("top_floor"),
-            },
-        )
 
-        result = self.cur.fetchone()
+        data = {
+            "prop_id": property_id,
+            "floorplan_id": floorplan_id,
+            "unit_number": item.get("unit_number"),
+            "floor_number": item.get("floor_number"),
+            "building_name": item.get("building_name"),
+            "is_on_top_floor": item.get("top_floor"),
+        }
+
+        cur.execute(query, data)
+        result = cur.fetchone()
         if not result:
             raise ValueError(
                 f"Failed to retrieve unit_id for property_id={property_id} and unit_number={item['unit_number']}"
@@ -288,8 +291,8 @@ class PostgresPipeline:
         self.logger.info(f"Upserted unit_id: {result[0]}")
         return result[0]
 
-    def _insert_price_history(self, item: UnitItem, unit_id: int) -> None:
-        sql = """
+    def insert_price_history(self, cur: Cursor, item: UnitItem, unit_id: int) -> None:
+        query = """
             INSERT INTO price_history (
                 scraped_at,
                 unit_id,
@@ -299,47 +302,41 @@ class PostgresPipeline:
                 is_available,
                 available_date
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
         """
-        self.cur.execute(
-            sql,
-            (
-                item.get("scraped_at"),
-                unit_id,
-                item.get("rent_usd"),
-                item.get("deposit_usd"),
-                item.get("min_lease_term_months"),
-                item.get("is_available"),
-                item.get("available_date"),
-            ),
+
+        data = (
+            item.get("scraped_at"),
+            unit_id,
+            item.get("rent_usd"),
+            item.get("deposit_usd"),
+            item.get("min_lease_term_months"),
+            item.get("is_available"),
+            item.get("available_date"),
         )
 
-    def _insert_promo(self, item: PromoItem) -> int:
+        cur.execute(query, data)
+
+
+class PromoItemPipeline:
+    logger = logging.getLogger(__name__)
+
+    def process_item(self, item: Item, spider: Spider):
+        if not isinstance(item, PromoItem):
+            return item  # Pass through other item types
+
+        conn = getattr(spider.crawler, "postgres_conn", None)
+        if not conn:
+            raise ValueError("No PostgreSQL connection available in spider.")
+
+        self.logger.info("Processing PromoItem...")
+
+        with conn.cursor() as cur:
+            _ = self.insert_promo(cur, item)
+
+        return item
+
+    def insert_promo(self, cur: Cursor, item: PromoItem) -> int:
         # SQL logic, often using ON CONFLICT to retrieve the existing floorplan_id
         # and cache it, so the ApartmentUnitItem can use it later.
         raise NotImplementedError("Method not yet implemented.")
-
-    def _get_property_id(self, url: str) -> int:
-        # SQL logic to retrieve property_id based on a natural key
-        sql_select = """
-            SELECT property_id FROM properties
-            WHERE url = %s;
-        """
-        self.cur.execute(sql_select, (url,))
-        result = self.cur.fetchone()
-        if not result:
-            raise ValueError(f"Failed to retrieve property_id for URL={url}")
-        return result[0]
-
-    def _get_company_id(self, company_name: str) -> int:
-        sql = """
-            SELECT company_id FROM management_companies
-            WHERE name = %s;
-        """
-        self.cur.execute(sql, (company_name,))
-        result = self.cur.fetchone()
-        if not result:
-            raise ValueError(
-                f"Failed to retrieve company_id for company_name={company_name}"
-            )
-        return result[0]

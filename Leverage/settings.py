@@ -8,7 +8,9 @@
 #     https://docs.scrapy.org/en/latest/topics/spider-middleware.html
 
 import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
 BOT_NAME = "Leverage"
 
@@ -66,8 +68,11 @@ COOKIES_ENABLED = False
 # Configure item pipelines
 # See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
 ITEM_PIPELINES = {
-    "Leverage.pipelines.JsonPipeline": 300,
-    "Leverage.pipelines.PostgresPipeline": 1000,
+    # Database and Item pipelines
+    "Leverage.pipelines.PostgresConnectionPipeline": 1000,
+    "Leverage.pipelines.PropertyItemPipeline": 1500,
+    "Leverage.pipelines.PromoItemPipeline": 1600,
+    "Leverage.pipelines.UnitItemPipeline": 1700,
 }
 
 # Enable and configure the AutoThrottle extension (disabled by default)
@@ -116,17 +121,5 @@ FEEDS = {
 }
 
 # PostgreSQL connection settings for Item Pipeline
-DATABASE_CONFIG = {
-    # "drivername": "postgresql",
-    "host": "localhost",
-    "port": "5432",
-    "dbname": "leverage-db",
-    # TODO: Create a new role 'scraper' in your PostgreSQL with limited permissions
-    "user": "postgres",
-    "password": "hQt*&0vj1ZOS",
-}
-
-DB_DSN = os.environ.get(
-    "DATABASE_URL",
-    f"postgresql://postgres:{DATABASE_CONFIG['password']}@localhost:5432/leverage-db",
-)
+# TODO: Create a new role 'scraper' in your PostgreSQL with limited permissions
+DB_DSN = os.environ.get("DB_DSN")
