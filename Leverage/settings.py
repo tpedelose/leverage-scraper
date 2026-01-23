@@ -71,7 +71,7 @@ ITEM_PIPELINES = {
     # Database and Item pipelines
     "Leverage.pipelines.PostgresConnectionPipeline": 1000,
     "Leverage.pipelines.PropertyItemPipeline": 1500,
-    "Leverage.pipelines.PromoItemPipeline": 1600,
+    # "Leverage.pipelines.PromoItemPipeline": 1600,
     "Leverage.pipelines.UnitItemPipeline": 1700,
 }
 

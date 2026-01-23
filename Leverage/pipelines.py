@@ -4,10 +4,8 @@
 # See: https://docs.scrapy.org/en/latest/topics/item-pipeline.html
 from __future__ import annotations
 
-import json
 import psycopg
 import logging
-import psycopg2
 
 from Leverage.items import UnitItem, PromoItem, PropertyItem
 from psycopg import Rollback
@@ -15,9 +13,9 @@ from scrapy.exceptions import DropItem
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from psycopg import Cursor
     from scrapy import Spider, Item
     from scrapy.crawler import Crawler
-    from psycopg import Cursor
 
 
 class PostgresConnectionPipeline:
@@ -126,7 +124,7 @@ class PropertyItemPipeline:
         data = {
             "company_id": company_id,
             "name": item.get("property_name"),
-            "url": item.get("url"),
+            "url": item.get("url", "").rstrip("/"),
             "template": item.get("template_engine"),
             "address": item.get("address"),
             "city": item.get("city"),
@@ -180,8 +178,8 @@ class UnitItemPipeline:
 
     def get_property_id(self, cur: Cursor, url: str) -> int:
         # SQL logic to retrieve property_id based on a natural key
-        sql_select = "SELECT property_id FROM properties WHERE url = %s;"
-        cur.execute(sql_select, (url,))
+        query = "SELECT property_id FROM properties WHERE url = %s;"
+        cur.execute(query, (url,))
         result = cur.fetchone()
         if not result:
             raise ValueError(f"Failed to retrieve property_id for url={url}")

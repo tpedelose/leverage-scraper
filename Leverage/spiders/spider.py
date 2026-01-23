@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import psycopg
 import scrapy
+from psycopg.rows import dict_row
 from urlmatch import urlmatch
-
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from scrapy.crawler import Crawler
     from playwright.async_api import Route
 
 
@@ -17,35 +19,33 @@ class DatabaseSpider(scrapy.Spider):
     COMPANY_ID: int  # To be defined in subclasses
 
     @classmethod
-    def from_crawler(cls, crawler, *args, **kwargs) -> DatabaseSpider:
-        import psycopg2
-        from psycopg2.extras import DictCursor
+    def from_crawler(cls, crawler: Crawler, *args, **kwargs) -> DatabaseSpider:
+        db_dsn: str = crawler.settings.get("DB_DSN")
 
-        # Connect to DB
-        db_dsn = crawler.settings.get("DB_DSN")
-        with psycopg2.connect(db_dsn, cursor_factory=DictCursor) as conn:
-            cur: DictCursor = conn.cursor()  # type: ignore[var-annotated]
+        # cls.logger.info(f"DatabaseSpider connecting to DB with DSN: {db_dsn}")
+        with psycopg.connect(db_dsn) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Get property URLs to scrape
+                # TODO: Either rename this class or make it more generic
+                # TODO: Only select those that are designated for scraping
+                sql = "SELECT * FROM properties WHERE company_id=%(company_id)s"
+                cur.execute(
+                    sql,
+                    {
+                        "company_id": cls.COMPANY_ID,
+                    },
+                )
+                properties = cur.fetchall()
 
-            # Get property URLs to scrape
-            # TODO: Only select those that are designated for scraping
-            sql = "SELECT * FROM properties WHERE company_id=%(company_id)s"
-            cur.execute(
-                sql,
-                {
-                    "company_id": cls.COMPANY_ID,
-                },
-            )
-            properties = cur.fetchall()
-            start_urls = []
-            for entry in properties:
-                url = entry.get("url")
-                if url:
-                    start_urls.append(url)
+                start_urls = []
+                for entry in properties:
+                    url = entry.get("url")
+                    if url:
+                        start_urls.append(url)
 
-            # return cls(start_urls)
-            return super(DatabaseSpider, cls).from_crawler(
-                crawler, start_urls=start_urls, **kwargs
-            )
+                kwargs["start_urls"] = start_urls
+
+        return super().from_crawler(crawler, *args, **kwargs)
 
 
 class ContentBlockerSpider(scrapy.Spider):
