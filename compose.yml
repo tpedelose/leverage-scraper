@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: leverage_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_NAME}
+      # POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./sql/:/docker-entrypoint-initdb.d/  # Optional: for initial setup
+      # - ./sql/postgresql.conf:/etc/postgresql.conf
+    ports:
+      - "6543:5432"  # Optional: only if you need external access
+    healthcheck:
+       test: ["CMD-SHELL", "pg_isready -U postgres"]
+       interval: 10s
+       timeout: 5s
+       retries: 5
+    restart: always
+
+  # scraper:
+  #   build: ./Leverage
+  #   container_name: rent-scraper
+  #   depends_on:
+  #     - postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+volumes:
+  postgres_data:

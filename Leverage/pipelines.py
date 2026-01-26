@@ -36,7 +36,7 @@ class PostgresConnectionPipeline:
         return cls(db_dsn)
 
     def open_spider(self, spider: Spider):
-        self.conn = psycopg.connect(self.db_dsn)
+        self.conn = psycopg.connect(self.db_dsn, autocommit=True)
         # expose connection so other pipelines can use it
         spider.crawler.postgres_conn = self.conn
         spider.logger.info("Postgres connection opened.")
@@ -55,15 +55,16 @@ class PropertyItemPipeline:
         if not isinstance(item, PropertyItem):
             return item  # Pass through other item types
 
-        conn = getattr(spider.crawler, "postgres_conn", None)
+        conn: psycopg.Connection = getattr(spider.crawler, "postgres_conn")
         if not conn:
             raise ValueError("No PostgreSQL connection available in spider.")
 
         self.logger.info("Processing PropertyItem...")
-        company_name = item.get("company_name")
-        if not company_name:
+
+        if "company_name" not in item:
             # TODO: Should I pass item through for potential later use?
-            raise DropItem("PropertyItem missing company_url field.")
+            raise DropItem("PropertyItem missing company_name field.")
+        company_name = item["company_name"]
 
         with conn.cursor() as cur:
             company_name = self.get_company_id(cur, company_name)
@@ -72,6 +73,7 @@ class PropertyItemPipeline:
         return item
 
     def get_company_id(self, cur: Cursor, company_name: str) -> int:
+        # NOTE: Can probably remove this method if company_id is provided directly in the PropertyItem, from the specific indexer
         sql = "SELECT company_id FROM management_companies WHERE name = %s;"
         cur.execute(sql, (company_name,))
         result = cur.fetchone()
