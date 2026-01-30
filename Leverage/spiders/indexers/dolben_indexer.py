@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import scrapy
 import unicodedata
 import usaddress
 from pathlib import Path
@@ -12,6 +11,7 @@ from Leverage.spiders.indexers import IndexerSpider, regex_patterns
 from typing import TYPE_CHECKING, Generator
 
 if TYPE_CHECKING:
+    from scrapy import Item
     from scrapy.http import Response
 
 
@@ -24,18 +24,14 @@ class DolbenPropertyIndexer(IndexerSpider):
     start_urls: list[str] = ["https://www.dolben.com/find-a-community/"]
     company_name: str = "Dolben"
 
-    def parse(self, response: Response):
+    def parse(self, response: Response) -> Generator[Item]:
         # Save initial page for debugging
         self.save_page(response)
 
-        location_links = response.css(
-            ".community-list article[data-comp='property'] a::attr(href)"
-        ).getall()
-        for link in location_links:
-            yield scrapy.Request(
-                url=response.urljoin(link),
-                callback=self.parse_property_page,
-            )
+        # Follow links to individual property pages
+        property_links = response.css(".community-list article[data-comp='property'] a")
+        yield from response.follow_all(property_links, self.parse_property_page)  # type: ignore
+        # TODO? Consider opening a ticket about the type: ignore here
 
     def _get_schema_data(self, response: Response) -> dict:
         accepted_schemas = [
@@ -67,9 +63,7 @@ class DolbenPropertyIndexer(IndexerSpider):
 
         return metadata
 
-    def parse_property_page(
-        self, response: Response
-    ) -> Generator[PropertyItem, None, None]:
+    def parse_property_page(self, response: Response) -> Generator[PropertyItem]:
         self.logger.info(f"Parsing property page: {response.url}")
 
         template_engine = determine_template_engine(response)

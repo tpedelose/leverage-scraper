@@ -16,7 +16,7 @@ class DatabaseSpider(scrapy.Spider):
     A spider that connects to a database to retrieve start URLs.
     """
 
-    COMPANY_ID: int  # To be defined in subclasses
+    company_id: int  # To be defined in subclasses
 
     @classmethod
     def from_crawler(cls, crawler: Crawler, *args, **kwargs) -> DatabaseSpider:
@@ -32,7 +32,7 @@ class DatabaseSpider(scrapy.Spider):
                 cur.execute(
                     sql,
                     {
-                        "company_id": cls.COMPANY_ID,
+                        "company_id": cls.company_id,
                     },
                 )
                 properties = cur.fetchall()
@@ -81,6 +81,5 @@ class ContentBlockerSpider(scrapy.Spider):
             urlmatch(pattern, route.request.url) for pattern in self.blocked_domains
         ):
             await route.abort()
-
         else:
             await route.continue_()

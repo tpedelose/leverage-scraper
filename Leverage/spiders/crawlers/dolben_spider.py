@@ -1,5 +1,5 @@
+from Leverage.spiders.crawlers import DatabaseSpider
 from Leverage.spiders.crawlers.repli360_spider import Repli360Spider
-from Leverage.spiders.spider import DatabaseSpider
 
 
 class DolbenSpider(DatabaseSpider, Repli360Spider):
@@ -8,6 +8,7 @@ class DolbenSpider(DatabaseSpider, Repli360Spider):
     """
 
     name: str = "dolben"
+    company_id: int = 1  # Company ID in DB
 
     blocked_domains = set(
         [
@@ -17,5 +18,3 @@ class DolbenSpider(DatabaseSpider, Repli360Spider):
             "*://*.woorank.com/*",
         ]
     )
-
-    COMPANY_ID = 1  # Company ID in DB

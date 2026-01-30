@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import scrapy
 from Leverage.items import PropertyItem
 from Leverage.spiders.indexers import IndexerSpider
 
 from typing import TYPE_CHECKING, Generator
 
 if TYPE_CHECKING:
+    from scrapy import Item
     from scrapy.http import Response
 
 
@@ -20,23 +20,16 @@ class UDRPropertyIndexer(IndexerSpider):
     start_urls: list[str] = ["https://www.udr.com/search-apartments/"]
     company_name: str = "UDR"
 
-    def parse(self, response: Response):
+    def parse(self, response: Response) -> Generator[Item]:
         # Save initial page for debugging
         self.save_page(response)
 
-        # Extract property links from the main properties page
-        location_links = response.css(
-            ".location-list__item a.location-list__item-link::attr(href)"
-        ).getall()
-        for link in location_links:
-            yield scrapy.Request(
-                url=response.urljoin(link),
-                callback=self.parse_location_page,
-            )
+        # Follow links to location pages to get properties
+        location_links = response.css(".location-list__item a")
+        yield from response.follow_all(location_links, self.parse_location_page)  # type: ignore
+        # TODO? Consider opening a ticket about the type: ignore here
 
-    def parse_location_page(
-        self, response: Response
-    ) -> Generator[PropertyItem, None, None]:
+    def parse_location_page(self, response: Response) -> Generator[PropertyItem]:
         self.logger.info(f"Parsing location page: {response.url}")
 
         cards = response.css(".community-card")

@@ -10,6 +10,7 @@ from Leverage.spiders.crawlers import ContentBlockerSpider, DatabaseSpider
 from typing import TYPE_CHECKING, Generator
 
 if TYPE_CHECKING:
+    from scrapy import Item
     from scrapy.http import Response
 
 
@@ -19,6 +20,7 @@ class UDRSpider(DatabaseSpider, ContentBlockerSpider):
     """
 
     name: str = "udr"
+    company_id: int = 2  # Company ID in DB
 
     blocked_resource_types = set(["font", "image", "media"])
     blocked_domains = set(
@@ -28,7 +30,6 @@ class UDRSpider(DatabaseSpider, ContentBlockerSpider):
         ]
     )
 
-    COMPANY_ID = 2  # Company ID in DB
     VIEWMODEL_VARIABLE_TEXT = "window.udr.jsonObjPropertyViewModel"
 
     async def start(self):
@@ -50,7 +51,7 @@ class UDRSpider(DatabaseSpider, ContentBlockerSpider):
                 },
             )
 
-    def parse(self, response: Response) -> Generator[UnitItem | PromoItem, None, None]:
+    def parse(self, response: Response) -> Generator[Item]:
         # Template has a view model embedded in a script tag in the head. We'll take that.
         script_content = response.xpath(
             f"//script[contains(., '{self.VIEWMODEL_VARIABLE_TEXT}')]/text()"
@@ -88,7 +89,7 @@ class UDRSpider(DatabaseSpider, ContentBlockerSpider):
             unit["property_url"] = response.url
             yield unit
 
-    def parse_specials(self, json_data: dict) -> Generator[PromoItem, None, None]:
+    def parse_specials(self, json_data: dict) -> Generator[PromoItem]:
         """Parse specials from view model"""
         specials = json_data.get("allSpecials", [])
         for special in specials:
@@ -100,7 +101,7 @@ class UDRSpider(DatabaseSpider, ContentBlockerSpider):
                 has_available_units=special.get("hasAvailableUnits"),
             )
 
-    def parse_floorplans(self, json_data: dict) -> Generator[UnitItem, None, None]:
+    def parse_floorplans(self, json_data: dict) -> Generator[UnitItem]:
         """Parse floor plans from view model"""
         floor_plans = json_data.get("floorPlans", [])
         for floor_plan in floor_plans:

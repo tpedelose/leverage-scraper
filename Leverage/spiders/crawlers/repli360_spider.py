@@ -184,6 +184,8 @@ class Repli360Spider(ContentBlockerSpider):
     ) -> AsyncGenerator[UnitItem, None]:
         page = response.meta["playwright_page"]
 
+        # TODO! Switch to using API directly if possible
+
         # Get the list of floor plans
         floorplans = response.css("#all_available_tab .rracFloorplan")
         self.logger.info(f"Found {len(floorplans)} available floorplans.")
