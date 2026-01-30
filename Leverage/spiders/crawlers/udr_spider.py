@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from scrapy_playwright.page import PageMethod
 from Leverage.items import UnitItem, PromoItem
-from Leverage.spiders.spider import ContentBlockerSpider, DatabaseSpider
+from Leverage.spiders.crawlers import ContentBlockerSpider, DatabaseSpider
 
 from typing import TYPE_CHECKING, Generator
 

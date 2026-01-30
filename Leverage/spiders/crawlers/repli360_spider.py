@@ -9,7 +9,7 @@ from scrapy_playwright.page import PageMethod
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from urllib.parse import parse_qs, urlsplit
 from Leverage.items import UnitItem, PromoItem
-from Leverage.spiders.spider import ContentBlockerSpider
+from Leverage.spiders.crawlers import ContentBlockerSpider
 
 from typing import TYPE_CHECKING, AsyncGenerator
 
