@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import re
 import scrapy
 import unicodedata
 import usaddress
 from pathlib import Path
-from scrapy.http import Response
-from Leverage.spiders.utils import determine_template_engine
 from Leverage.items import PropertyItem
+from Leverage.spiders.utils import determine_template_engine
+from Leverage.spiders.indexers import IndexerSpider, regex_patterns
 
 from typing import TYPE_CHECKING, Generator
 
@@ -16,49 +15,35 @@ if TYPE_CHECKING:
     from scrapy.http import Response
 
 
-class DolbenPropertyIndexer(scrapy.Spider):
+class DolbenPropertyIndexer(IndexerSpider):
     """
     Spider to index Repli360 properties from the Repli360 main properties page.
     """
 
-    # TODO? Make configurable start_urls. Stored in database?
     name: str = "dolben_indexer"
     start_urls: list[str] = ["https://www.dolben.com/find-a-community/"]
     company_name: str = "Dolben"
 
-    accepted_schemas = [
-        # Ordered by priority
-        {"Apartment", "ApartmentComplex", "LocalBusiness"},
-        {"WebSite"},
-    ]
-
-    patterns: dict = {
-        "phone": r"(\+\d{1,2}\s?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}",
-        "email": r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
-    }
-    for key, pattern in patterns.items():
-        patterns[key] = re.compile(pattern)
-
-    async def start(self):
-        for url in self.start_urls:
-            yield scrapy.Request(url=url)
-
     def parse(self, response: Response):
-        self.logger.info("Saving initial page content.")
-        filename = f"output/{self.name}_page_loaded.html"
-        Path(filename).write_bytes(response.body)
+        # Save initial page for debugging
+        self.save_page(response)
 
         location_links = response.css(
             ".community-list article[data-comp='property'] a::attr(href)"
         ).getall()
         for link in location_links:
-            # Follow each property link
             yield scrapy.Request(
                 url=response.urljoin(link),
                 callback=self.parse_property_page,
             )
 
     def _get_schema_data(self, response: Response) -> dict:
+        accepted_schemas = [
+            # Ordered by priority
+            {"Apartment", "ApartmentComplex", "LocalBusiness"},
+            {"WebSite"},
+        ]
+
         # Try to extract JSON-LD metadata
         json_ld_data = response.css("script[type='application/ld+json']::text").getall()
 
@@ -74,7 +59,7 @@ class DolbenPropertyIndexer(scrapy.Spider):
                 schema_types = [schema_types]
 
             # Find data structure with priority
-            for accepted_schema_set in self.accepted_schemas:
+            for accepted_schema_set in accepted_schemas:
                 if any(schema in accepted_schema_set for schema in schema_types):
                     # TODO: Consider case where multiple primary schemas exist. Should we combine?
                     metadata = meta
@@ -190,7 +175,7 @@ class DolbenPropertyIndexer(scrapy.Spider):
         unparsed_column_text = column_text.copy()
         for i, text in enumerate(column_text):
             for key in ["phone", "email"]:
-                match = self.patterns[key].search(text)
+                match = regex_patterns[key].search(text)
                 if match:
                     data[key] = match.group()
                     # Remove to avoid interference with address parsing

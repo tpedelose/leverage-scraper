@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import scrapy
-from pathlib import Path
 from Leverage.items import PropertyItem
+from Leverage.spiders.indexers import IndexerSpider
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generator
 
 if TYPE_CHECKING:
     from scrapy.http import Response
 
 
-class UDRPropertyIndexer(scrapy.Spider):
+class UDRPropertyIndexer(IndexerSpider):
     """
     Spider to index UDR properties from the UDR main properties page.
     """
@@ -20,14 +20,9 @@ class UDRPropertyIndexer(scrapy.Spider):
     start_urls: list[str] = ["https://www.udr.com/search-apartments/"]
     company_name: str = "UDR"
 
-    async def start(self):
-        for url in self.start_urls:
-            yield scrapy.Request(url=url)
-
     def parse(self, response: Response):
-        self.logger.info("Saving initial page content.")
-        filename = f"output/{self.name}_page_loaded.html"
-        Path(filename).write_bytes(response.body)
+        # Save initial page for debugging
+        self.save_page(response)
 
         # Extract property links from the main properties page
         location_links = response.css(
@@ -39,7 +34,9 @@ class UDRPropertyIndexer(scrapy.Spider):
                 callback=self.parse_location_page,
             )
 
-    def parse_location_page(self, response: Response):
+    def parse_location_page(
+        self, response: Response
+    ) -> Generator[PropertyItem, None, None]:
         self.logger.info(f"Parsing location page: {response.url}")
 
         cards = response.css(".community-card")
