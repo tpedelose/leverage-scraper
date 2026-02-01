@@ -1,22 +1,17 @@
 from __future__ import annotations
 
-import asyncio
-import re
+import base64
+import json
 import scrapy
+from scrapy import Selector, Spider
 from datetime import datetime, timezone
-from scrapy import Selector
-from scrapy_playwright.page import PageMethod
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from urllib.parse import parse_qs, urlsplit
 from Leverage.items import UnitItem, PromoItem
-from Leverage.spiders.crawlers import ContentBlockerSpider
 
-from typing import TYPE_CHECKING, AsyncGenerator
+from typing import TYPE_CHECKING, AsyncGenerator, Generator
 
 if TYPE_CHECKING:
     from scrapy.http import Response
-    from playwright.async_api import Page
-    from twisted.python.failure import Failure
 
 
 APT_DETAILS_LABEL_MAP = {
@@ -31,137 +26,249 @@ APT_DETAILS_LABEL_MAP = {
 }
 
 
-class Repli360Spider(ContentBlockerSpider):
+class Repli360Spider(Spider):
     """
     Spider to scrape apartment listings from websites using the Repli360 template engine.
     """
-
-    custom_settings = {
-        # TODO: Find way to speed this up. Seems to be some rate-limiting going on.
-        "CONCURRENT_REQUESTS": 1,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
-        # "PLAYWRIGHT_MAX_PAGES_PER_CONTEXT": 4,
-    }
 
     name: str = "repli360"
     start_urls: list[str] = []
 
     blocked_resource_types = set(["font", "image", "media"])
 
-    POPUP_CLOSE_BUTTON_SELECTOR = ".dmPopupClose"
-    APT_DETAILS_TABLE_SELECTOR = "#fp_table1"
-    APT_MODAL_SELECTOR = ".rrac_apartment_details"
+    async def parse(self, response: Response):
+        """
+        Parse the main property page to find the rrac-website-script script tag.
+        Use this to get the site_id needed to request property data.
+        """
 
-    async def start(self):
-        for url in self.start_urls:
+        # TODO: Add privacy policy scraping
+
+        # Check for special promotions section
+        yield self.parse_special(response)
+
+        # Parse main content, starting with script
+        if script_url := response.css(
+            'script[src*="/rrac-website-script"]::attr(src)'
+        ).get():
             yield scrapy.Request(
-                url=url,
-                meta={
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        # Block unnecessary resources
-                        PageMethod(
-                            "route",
-                            url="**/*",
-                            handler=self.route_handler,
-                        ),
-                        # Ensure the main content is loaded
-                        PageMethod("wait_for_load_state", "networkidle"),
-                        # Wait a moment for the popup to appear
-                        PageMethod(
-                            "wait_for_selector",
-                            self.POPUP_CLOSE_BUTTON_SELECTOR,
-                        ),
-                        # Close pop-up modal if it appears
-                        PageMethod("click", self.POPUP_CLOSE_BUTTON_SELECTOR),
-                        # Ensure the apartment listings tab is loaded
-                        PageMethod("wait_for_selector", "#all_available_tab"),
-                    ],
-                },
-                errback=self.handle_error,
+                url=script_url,
+                callback=self.parse_script,
+                cb_kwargs={"start_url": response.url},
             )
 
-    async def parse(
-        self, response: Response
-    ) -> AsyncGenerator[UnitItem | PromoItem, None]:
-        yield self.parse_specials(response)
-        async for apt in self.parse_floorplans(response):
-            apt["property_url"] = response.url
-            yield apt
+    def parse_special(self, response: Response) -> PromoItem | None:
+        """
+        Parse the special promotions section if available.
+        """
 
-    def parse_specials(self, response: Response) -> PromoItem:
-        # NOTE: Assumes only one specials header block
-        header_info = response.css(".headerWrapper")
-        deals_text = header_info.css("::text").getall()
-        deals_text = [info.strip() for info in deals_text if info.strip()]
-        self.logger.info(f"Extracted deals info: {deals_text}")
-        return PromoItem(
-            text=" ".join(deals_text),
-            scraped_at=datetime.now(timezone.utc).isoformat(),
-            property_url=response.url,
-        )
-
-    async def _click_and_wait(
-        self,
-        page: Page,
-        click_selector: str,
-        wait_selector: str,
-        visible: bool = True,
-        retries: int = 2,
-        timeout: int = 30000,
-    ) -> None:
-        """Click a selector and wait for a DOM selector to become visible/hidden."""
-
-        if await page.locator(click_selector).count() == 0:
-            raise ValueError(f"Click selector '{click_selector}' not found on page.")
+        # Text is actually encoded as Base64 in a data attribute
+        encoded_data = response.xpath(
+            '//div[contains(@class, "headerWrapper")]//parent::*'
+        ).attrib.get("data-widget-config")
+        if not encoded_data:
+            return
 
         try:
-            await page.locator(click_selector).first.click()
-        except PlaywrightTimeoutError as e:
-            self.logger.debug(
-                f"Initial click timeout for {click_selector} on page {page.url}: {e}"
+            decoded_bytes = base64.b64decode(encoded_data).decode("utf-8")
+            json_data = json.loads(decoded_bytes)
+
+            promo_texts = []
+            for key in ("sliderTitle", "sliderDescription", "sliderDisclaimer"):
+                if value := json_data.get(key):
+                    if text := Selector(text=value).xpath("*//text()").get(""):
+                        promo_texts.append(text.strip())
+
+            return PromoItem(
+                text="\n".join(promo_texts).strip(),
+                scraped_at=datetime.now(timezone.utc).isoformat(),
+                property_url=response.url,
             )
 
-        total_tries = retries + 1  # initial try + retries
-        state = "visible" if visible else "hidden"
+        except Exception as e:
+            self.logger.error(f"Error decoding promotions data: {e}")
 
-        for attempt in range(1, total_tries + 1):
-            exp_time = timeout * (2 ** (attempt - 1))  # exponential backoff
+    async def parse_script(
+        self, response: Response, **kwargs
+    ) -> AsyncGenerator[scrapy.FormRequest]:
+        """
+        Parse the rrac-website-script to extract site_id and request property data.
+        """
 
-            try:
-                # If a DOM selector is provided, wait for it
-                await page.locator(wait_selector).first.wait_for(
-                    state=state, timeout=exp_time
-                )
-                return
-            except PlaywrightTimeoutError as e:
-                self.logger.debug(
-                    f"Playwright timeout during click (page {page.url}, attempt {attempt}): {e}"
-                )
-                if attempt >= retries:
-                    self.logger.warning(
-                        f"Final retry exhausted for _click_and_wait after timeout. Page: {page.url} (click: {click_selector} -> wait for: {wait_selector})"
-                    )
-                    raise e
+        arg_map = {
+            "site_id": "site_id",
+            "move_in_date": "desiredMoveinDate",
+        }
 
-            except Exception as e:
-                self.logger.error(f"Error in _click_and_wait (attempt {attempt}): {e}")
-                if attempt >= retries:
-                    return
+        next_kwargs = {
+            arg_name: response.css("::text").re_first(
+                rf"var {var_name}\s*=\s*'([^']+)'"
+            )
+            or ""
+            for arg_name, var_name in arg_map.items()
+        }
 
-            # If we've reached here and there are remaining attempts, pause and retry.
-            if attempt < retries:
-                await page.wait_for_timeout(150)
+        # Send post request to get property data
+        yield scrapy.FormRequest(
+            url="https://app.repli360.com/admin/template-render",
+            method="POST",
+            formdata={
+                "site_id": next_kwargs["site_id"],
+                "action": "",
+                # "ready_script": "dom_load",
+                "ready_script": "",
+                "template_type": "",
+                "source": "",
+                "property_id": "",
+            },
+            callback=self.parse_property,
+            cb_kwargs={**next_kwargs, "start_url": kwargs.get("start_url")},
+        )
+
+    async def parse_property(
+        self, response: Response, site_id: str, move_in_date: str, **kwargs
+    ) -> AsyncGenerator[scrapy.FormRequest]:
+        """
+        Parse the property data response to find available floorplans.
+        """
+
+        floorplans = response.css("#all_available_tab .rracFloorplan")
+        self.logger.info(
+            f"Found {len(floorplans)} available floorplans"
+            + (f" on {kwargs.get('start_url')}." if "start_url" in kwargs else "")
+        )
+
+        for floorplan in floorplans:
+            # Create a UnitItem for the floorplan that we can deepcopy later
+            floorplan_item = UnitItem(
+                property_url=kwargs.get("start_url"),
+            )
+
+            fp_info = self._parse_floorplan_card(floorplan)  # type: ignore
+            if "units_available" in fp_info:
+                del fp_info["units_available"]  # Not needed at floorplan level
+            floorplan_item.update(fp_info)
+
+            # Prefer explicit attributes if available
+            floorplan_item.update(
+                {
+                    "floorplan_id": floorplan.attrib.get("data-id"),
+                    "floorplan_name": floorplan.attrib.get("data-fpname"),
+                    "num_bedrooms": floorplan.attrib.get("data-bed"),
+                    "square_footage": floorplan.attrib.get("data-size"),
+                }
+            )
+
+            # "getUnitListByFloor(this, 'B2A' , 2 , 2221,``);"
+            # this, floorPlanID , template_type , site_id, _mode, _type='2d', _special='no'
+            get_floor_func = floorplan.css(".right-sec a").attrib["onclick"]
+            if not get_floor_func:
+                self.logger.warning("No 'onclick' found for floorplan link, skipping.")
                 continue
 
-    def parse_apartment_listing(self, selector: Selector) -> UnitItem:
-        """
-        Parse a single apartment listing row into a UnitItem.
-        Kept synchronous so it can be reused outside async context (and easily unit-tested).
-        """
-        item = UnitItem()
+            get_floor_args = (
+                get_floor_func.removeprefix("getUnitListByFloor(")
+                .removesuffix(");")
+                .split(",")
+            )
+            floorplan_id = get_floor_args[1].strip().strip("'")
 
+            yield scrapy.FormRequest(
+                url="https://app.repli360.com/admin/getUnitListByFloor",
+                method="POST",
+                formdata={
+                    "floorPlanID": floorplan_id,
+                    "moveinDate": move_in_date,
+                    "site_id": site_id,
+                    "template_type": "",
+                    "mode": "apt",
+                    "type": "2d",
+                    "currentanuualterm": "",
+                    "AcademicTerm": "",
+                    "RentalLevel": "",
+                    "special": "no",
+                    "zpopUp": "",
+                },
+                callback=self.parse_unit_table,
+                cb_kwargs={
+                    "start_url": kwargs.get("start_url"),
+                    "floorplan_item": floorplan_item,
+                },
+            )
+
+    def parse_unit_table(self, response: Response, **kwargs) -> Generator[UnitItem]:
+        # Get the units HTML
+        response_json = json.loads(response.text)
+        table_selector = Selector(
+            text=response_json.get("str", "")
+        )  # TODO? Turn into HTMLResponse
+
+        floorplan_item: UnitItem | None = kwargs.get("floorplan_item")
+        if not floorplan_item:
+            self.logger.error("No floorplan_item passed to parse_unit_table.")
+            return
+
+        scraped_at = datetime.now(timezone.utc)
+        today_date = scraped_at.date()
+
+        units = table_selector.css("tr.unitlisting")
+        self.logger.info(
+            f"Found {len(units)} available units for floorplan {floorplan_item.get('floorplan_name')}"
+            + (f" on {kwargs.get('start_url')}." if "start_url" in kwargs else "")
+        )
+
+        for unit in units:
+            unit_item = floorplan_item.deepcopy()
+            apt_info = self._parse_listing(unit)
+            unit_item.update(apt_info)
+
+            # Add floorplan-level metadata
+            unit_item["scraped_at"] = scraped_at.isoformat()
+
+            # Clean and process availability info
+            available_date = unit_item.get("available_date")
+            is_available = unit_item.get("is_available")
+            if available_date:
+                if available_date.lower() == "available now":
+                    available_date = today_date
+                else:
+                    available_date = datetime.strptime(
+                        available_date, "%m-%d-%Y"
+                    ).date()
+                if is_available is None:
+                    is_available = available_date <= today_date
+                available_date = available_date.isoformat()
+            unit_item["available_date"] = available_date
+            unit_item["is_available"] = is_available
+
+            yield unit_item
+
+    def _parse_floorplan_card(self, selector: Selector) -> dict[str, str]:
+        """
+        Get floorplan info from text, e.g., "2 Bed | 2 Bath | 1,200 Sq Ft | 5 Units Available"
+        """
+
+        # TODO: Make this more robust to potential HTML changes
+        fp_desc = selector.css(".decp p::text").get()
+
+        fp_info = {}
+        if fp_desc:
+            parts = [part.strip() for part in fp_desc.split("|")]
+
+            for part in parts:
+                if "Bed" in part:
+                    fp_info["num_bedrooms"] = part.split(" ")[0].strip()
+                elif "Bath" in part:
+                    fp_info["num_bathrooms"] = part.split(" ")[0].strip()
+                elif "Sq. Ft." in part:
+                    fp_info["square_footage"] = part.split(" ")[0].strip()
+                elif "Units Available" in part:
+                    fp_info["units_available"] = part.split(" ")[0].strip()
+
+        return fp_info
+
+    def _parse_listing(self, selector: Selector) -> dict[str, str]:
+        item = {}
         for field_key, label_texts in APT_DETAILS_LABEL_MAP.items():
             for label_text in label_texts:
                 value = self._get_apt_data_by_label(selector, label_text)
@@ -178,93 +285,6 @@ class Repli360Spider(ContentBlockerSpider):
                 item["min_lease_term_months"] = qs["Term"][0]
 
         return item
-
-    async def parse_floorplans(
-        self, response: Response
-    ) -> AsyncGenerator[UnitItem, None]:
-        page = response.meta["playwright_page"]
-
-        # TODO! Switch to using API directly if possible
-
-        # Get the list of floor plans
-        floorplans = response.css("#all_available_tab .rracFloorplan")
-        self.logger.info(f"Found {len(floorplans)} available floorplans.")
-
-        for floorplan in floorplans:
-            # Click the anchor to load the floor plan details
-            floorplan_id = floorplan.attrib.get("data-id")
-            if not floorplan_id:
-                self.logger.warning("Floorplan missing data-id attribute, skipping.")
-                continue
-
-            # Get from request directly to avoid timing issues with dynamic content
-            anchor_selector = f'#all_available_tab .rracFloorplan[data-id="{floorplan_id}"] .right-cta a'
-            async with page.expect_response("**/admin/getUnitListByFloor") as resp_info:
-                await page.locator(anchor_selector).first.click()
-
-            api_response = await resp_info.value
-            data = await api_response.json()
-
-            # Track scrape time after dynamic content has loaded
-            scraped_dt = datetime.now(timezone.utc)
-            today = scraped_dt.date()
-
-            # Turn the returned HTML table into a Scrapy Selector for parsing
-            html_response = data.get("str")
-            table_sel = Selector(text=html_response)
-            apartment_rows = table_sel.css(
-                f"{self.APT_DETAILS_TABLE_SELECTOR} tr.unitlisting"
-            )
-            self.logger.info(f"Found {len(apartment_rows)} apartment listings.")
-
-            # Get bath info from details, pattern usually "One Bedroom | 1 Bath |"
-            floorplan_details = floorplan.css(".decp p::text").get()
-            num_bathrooms = None
-            if floorplan_details:
-                bath_match = re.search(r"(\d+(\.\d+)?)\s*Bath", floorplan_details)
-                if bath_match:
-                    num_bathrooms = bath_match.group(1)
-            for row in apartment_rows:
-                listing = self.parse_apartment_listing(row)
-
-                # Clean and process availability info
-                available_date = listing.get("available_date")
-                is_available = listing.get("is_available")
-                if available_date:
-                    if available_date.lower() == "available now":
-                        available_date = today
-                    else:
-                        available_date = datetime.strptime(
-                            available_date, "%m-%d-%Y"
-                        ).date()
-                    if is_available is None:
-                        is_available = available_date <= today
-                    available_date = available_date.isoformat()
-                listing["available_date"] = available_date
-                listing["is_available"] = is_available
-
-                # Add floorplan-level metadata
-                listing["scraped_at"] = scraped_dt.isoformat()
-                listing["floorplan_name"] = floorplan.attrib.get("data-fpname")
-                listing["floorplan_id"] = floorplan.attrib.get("data-id")
-                listing["num_bedrooms"] = floorplan.attrib.get("data-bed")
-                listing["num_bathrooms"] = num_bathrooms
-                listing["square_footage"] = floorplan.attrib.get("data-size")
-                yield listing
-
-            # close and restore state
-            await self._click_and_wait(
-                page,
-                "#rrac_apartment_details .rrac_galleryClose",
-                self.APT_MODAL_SELECTOR,
-                visible=False,
-            )
-
-            # brief pause before next iteration to avoid rate limiting
-            await asyncio.sleep(0.25)
-
-        # Make sure to close the page to avoid hangs
-        await page.close()
 
     def _get_apt_data_by_label(
         self, row_selector: Selector, label_text: str
@@ -304,10 +324,3 @@ class Repli360Spider(ContentBlockerSpider):
             return value.strip()
 
         return None
-
-    async def handle_error(self, failure: Failure) -> None:
-        try:
-            page = failure.request.meta["playwright_page"]  # type: ignore[attr-defined]
-            await page.close()
-        except Exception as e:
-            self.logger.error(f"Error closing Playwright page: {e}")
